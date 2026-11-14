@@ -40,4 +40,14 @@ IMAGE_FSTYPES:remove = " mtd-static mtd-static-tar mtd-static-alltar mtd-ubi mtd
 
 # Enable uart console
 ENABLE_UART = "1"
-SERIAL_CONSOLES = "115200;ttyS0"
+
+# Deploy u-boot
+RPI_USE_U_BOOT = "1"
+
+# Enable module operation
+PACKAGECONFIG:append:pn-systemd = " kmod"
+
+# Add wlan features
+IMAGE_INSTALL:append = " linux-firmware-rpidistro-bcm43455 kernel-module-brcmfmac"
+IMAGE_INSTALL:append = " wireless-regdb-static wpa-supplicant iw"
+KERNEL_MODULE_AUTOLOAD:append = " brcmfmac"
