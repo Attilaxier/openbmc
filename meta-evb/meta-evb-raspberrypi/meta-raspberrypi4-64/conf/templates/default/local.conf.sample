@@ -51,3 +51,6 @@ PACKAGECONFIG:append:pn-systemd = " kmod"
 IMAGE_INSTALL:append = " linux-firmware-rpidistro-bcm43455 kernel-module-brcmfmac"
 IMAGE_INSTALL:append = " wireless-regdb-static wpa-supplicant iw"
 KERNEL_MODULE_AUTOLOAD:append = " brcmfmac"
+
+# Add WiFi settings redfish API and Webpage
+ENABLE_WIFI_UI = 1

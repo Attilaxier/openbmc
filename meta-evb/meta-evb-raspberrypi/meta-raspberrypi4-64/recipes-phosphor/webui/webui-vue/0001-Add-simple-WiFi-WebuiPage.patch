@@ -1,0 +1,421 @@
+From 63a4b8b8a22965ccd7e15aa5dcb971e3468972cc Mon Sep 17 00:00:00 2001
+From: attilaxier <developer@example.com>
+Date: Sun, 15 Nov 2026 03:08:37 +0000
+Subject: [PATCH] Add simple WiFi WebuiPage
+
+- Add Wi-Fi settings view with network list and signal strength bars
+- Add /settings/wifi route and navigation entry
+- Add featureFlags so the page is only enabled with VITE_WIFI_UI_API=true
+
+Upstream-Status: Inappropriate [oe specific]
+---
+ .../AppNavigation/AppNavigationMixin.js       |  20 +-
+ src/featureFlags.js                           |   3 +
+ src/router/routes.js                          |  26 +-
+ src/views/Settings/WiFi/WiFi.vue              | 249 ++++++++++++++++++
+ src/views/Settings/WiFi/index.js              |   2 +
+ 5 files changed, 297 insertions(+), 3 deletions(-)
+ create mode 100644 src/featureFlags.js
+ create mode 100644 src/views/Settings/WiFi/WiFi.vue
+ create mode 100644 src/views/Settings/WiFi/index.js
+
+diff --git a/src/components/AppNavigation/AppNavigationMixin.js b/src/components/AppNavigation/AppNavigationMixin.js
+index dc9e050..913109b 100644
+--- a/src/components/AppNavigation/AppNavigationMixin.js
++++ b/src/components/AppNavigation/AppNavigationMixin.js
+@@ -7,6 +7,16 @@ import IconSecurity from '@carbon/icons-vue/es/security/16';
+ import IconChevronUp from '@carbon/icons-vue/es/chevron--up/16';
+ import IconDataBase from '@carbon/icons-vue/es/data--base--alt/16';
+ import i18n from '@/i18n';
++
++import { featureFlags } from '@/featureFlags';
++
++const filterItems = (items) =>
++  items
++    .filter((item) => !item.feature || featureFlags[item.feature])
++    .map((item) =>
++      item.children ? { ...item, children: filterItems(item.children) } : item,
++    );
++
+ const roles = {
+   administrator: 'Administrator',
+   operator: 'Operator',
+@@ -27,7 +37,7 @@ const AppNavigationMixin = {
+   },
+   data() {
+     return {
+-      navigationItems: [
++      navigationItems: filterItems([
+         {
+           id: 'overview',
+           label: i18n.global.t('appNavigation.overview'),
+@@ -136,6 +146,12 @@ const AppNavigationMixin = {
+               label: i18n.global.t('appNavigation.network'),
+               route: '/settings/network',
+             },
++            {
++              id: 'wifi',
++              label: 'Wi-Fi',
++              route: '/settings/wifi',
++              feature: 'wifi',
++            },
+             {
+               id: 'power-restore-policy',
+               label: i18n.global.t('appNavigation.powerRestorePolicy'),
+@@ -192,7 +208,7 @@ const AppNavigationMixin = {
+             },
+           ],
+         },
+-      ],
++      ]),
+     };
+   },
+ };
+diff --git a/src/featureFlags.js b/src/featureFlags.js
+new file mode 100644
+index 0000000..9135a41
+--- /dev/null
++++ b/src/featureFlags.js
+@@ -0,0 +1,3 @@
++export const featureFlags = {
++  wifi: import.meta.env.VITE_WIFI_UI_API === 'true',
++};
+\ No newline at end of file
+diff --git a/src/router/routes.js b/src/router/routes.js
+index f3f6f6b..b8d7efd 100644
+--- a/src/router/routes.js
++++ b/src/router/routes.js
+@@ -14,6 +14,7 @@ import UserManagement from '@/views/SecurityAndAccess/UserManagement';
+ import Login from '@/views/Login';
+ import LoginLayout from '@/layouts/LoginLayout';
+ import Network from '@/views/Settings/Network';
++import WiFi from '@/views/Settings/WiFi';
+ import Overview from '@/views/Overview';
+ import PageNotFound from '@/views/PageNotFound';
+ import PostCodeLogs from '@/views/Logs/PostCodeLogs';
+@@ -34,6 +35,18 @@ import i18n from '@/i18n';
+ 
+ import Dumps from '@/views/Logs/Dumps';
+ 
++import { featureFlags } from '@/featureFlags';
++
++const isEnabled = (route) =>
++  !route.meta?.feature || featureFlags[route.meta.feature];
++
++const filterRoutes = (list) =>
++  list.filter(isEnabled).map((route) =>
++    route.children
++      ? { ...route, children: filterRoutes(route.children) }
++      : route,
++  );
++
+ const roles = {
+   administrator: 'Administrator',
+   operator: 'Operator',
+@@ -249,6 +262,15 @@ const routes = [
+           title: i18n.global.t('appPageTitle.network'),
+         },
+       },
++      {
++        path: '/settings/wifi',
++        name: 'wifi',
++        component: WiFi,
++        meta: {
++          title: 'Wi-Fi Settings',
++          feature: 'wifi',
++        },
++      },
+       {
+         path: '/settings/power-restore-policy',
+         name: 'power-restore-policy',
+@@ -310,4 +332,6 @@ const routes = [
+   },
+ ];
+ 
+-export { routes as default, roles };
++const filteredRoutes = filterRoutes(routes);
++
++export { filteredRoutes as default, roles };
+\ No newline at end of file
+diff --git a/src/views/Settings/WiFi/WiFi.vue b/src/views/Settings/WiFi/WiFi.vue
+new file mode 100644
+index 0000000..5c11f2e
+--- /dev/null
++++ b/src/views/Settings/WiFi/WiFi.vue
+@@ -0,0 +1,268 @@
++<template>
++  <b-container fluid="xl">
++    <page-title title="Wi-Fi Settings" />
++
++    <b-card class="mb-4">
++      <div class="d-flex justify-content-between align-items-center">
++        <div>
++          <h5 class="mb-1">Wi-Fi</h5>
++          <small class="text-muted">
++            When enabled, nearby wireless access points can be scanned by pressing below Rescan button
++          </small>
++        </div>
++        <b-form-checkbox
++          :model-value="wifiEnabled"
++          :disabled="loading"
++          switch
++          size="lg"
++          @update:model-value="toggleWiFi"
++        >
++          {{ loading ? 'Loading...' : wifiEnabled ? 'Enabled' : 'Disabled' }}
++        </b-form-checkbox>
++      </div>
++    </b-card>
++
++    <div v-if="wifiEnabled">
++      <div class="d-flex justify-content-between align-items-center mb-3">
++        <h5 class="mb-0">Available networks</h5>
++        <b-button variant="outline-primary" size="sm" @click="scanNetworks">
++          Rescan
++        </b-button>
++      </div>
++
++      <b-list-group>
++        <b-list-group-item
++          v-for="net in networks"
++          :key="net.SSID"
++          button
++          class="d-flex justify-content-between align-items-center"
++          @click="handleNetworkClick(net)"
++        >
++          <div>
++            <strong>{{ net.SSID }}</strong>
++            <b-badge v-if="net.Connected" variant="success" class="ms-2">
++              Connected (click to disconnect)
++            </b-badge>
++          </div>
++          <div class="d-flex align-items-center text-muted">
++            <span
++              class="signal-bars me-2"
++              :class="`signal-${signalLevel(net.Signal).color}`"
++              :title="formatSignalBars(net.Signal)"
++              role="img"
++              :aria-label="`Signal ${formatSignalBars(net.Signal)}`"
++            >
++              <span
++                v-for="n in 3"
++                :key="n"
++                class="signal-bar"
++                :class="{ active: n <= signalLevel(net.Signal).bars }"
++                :style="{ height: `${n * 5 + 3}px` }"
++              />
++            </span>
++            <span>{{ net.Signal }} dBm</span>
++          </div>
++        </b-list-group-item>
++      </b-list-group>
++    </div>
++
++    <b-modal
++      v-model="showConnectModal"
++      :title="`Connect to ${selectedNetwork ? selectedNetwork.SSID : ''}`"
++      ok-title="Connect"
++      cancel-title="Cancel"
++      :ok-disabled="password.length < 8"
++      @ok="connectToNetwork"
++    >
++      <b-form-group
++        label="Wi-Fi password"
++        description="<br />WPA/WPA2 password, at least 8 characters"
++      >
++        <b-form-input
++          v-model="password"
++          type="password"
++          placeholder="Enter password"
++          autocomplete="off"
++        />
++      </b-form-group>
++    </b-modal>
++
++    <b-modal
++      v-model="showDisconnectModal"
++      title="Disconnect Wi-Fi"
++      ok-title="Disconnect"
++      ok-variant="danger"
++      cancel-title="Cancel"
++      @ok="disconnectNetwork"
++    >
++      <p class="mb-0">
++        Are you sure you want to disconnect from
++        <strong>{{ selectedNetwork ? selectedNetwork.SSID : '' }}</strong>?
++      </p>
++    </b-modal>
++  </b-container>
++</template>
++
++<script>
++import api from '@/store/api';
++import BVToastMixin from '@/components/Mixins/BVToastMixin';
++import PageTitle from '@/components/Global/PageTitle';
++
++const WIFI_BASE = '/redfish/v1/Managers/bmc/EthernetInterfaces/wlan0';
++
++export default {
++  name: 'WiFiSettings',
++  components: { PageTitle },
++  mixins: [BVToastMixin],
++  data() {
++    return {
++      loading: true,
++      wifiEnabled: false,
++      networks: [],
++      selectedNetwork: null,
++      password: '',
++      showConnectModal: false,
++      showDisconnectModal: false,
++    };
++  },
++  created() {
++    this.fetchWiFiStatus();
++  },
++  methods: {
++    uniqueNetworks(list) {
++      const bySsid = new Map();
++      list.forEach((net) => {
++        const current = bySsid.get(net.SSID);
++        if (
++          !current ||
++          (net.Connected && !current.Connected) ||
++          (net.Connected === current.Connected && net.Signal > current.Signal)
++        ) {
++          bySsid.set(net.SSID, net);
++        }
++      });
++      return [...bySsid.values()].sort(
++        (a, b) =>
++          Number(b.Connected) - Number(a.Connected) || b.Signal - a.Signal,
++      );
++    },
++    async fetchWiFiStatus() {
++      try {
++        const { data } = await api.get(`${WIFI_BASE}/Oem/OpenBmc/WiFi`);
++        this.wifiEnabled = !!data.Enabled;
++        this.networks = this.uniqueNetworks(data.Networks || []);
++      } catch (error) {
++        this.errorToast('Failed to load Wi-Fi status.');
++      } finally {
++        this.loading = false;
++      }
++    },
++    async toggleWiFi(enabled) {
++      try {
++        // Disconnect first when disabling so the backend can release the link and IP
++        if (!enabled) {
++          const connected = this.networks.find((n) => n.Connected);
++          if (connected) {
++            await api.post(`${WIFI_BASE}/Actions/Oem/WiFi.Disconnect`);
++          }
++        }
++
++        await api.patch(`${WIFI_BASE}/Oem/OpenBmc/WiFi`, { Enabled: enabled });
++        this.wifiEnabled = enabled;
++        if (enabled) {
++          await this.scanNetworks();
++        } else {
++          this.networks = [];
++        }
++      } catch (error) {
++        this.errorToast('Failed to change Wi-Fi state.');
++        await this.fetchWiFiStatus();
++      }
++    },
++    async scanNetworks() {
++      try {
++        await api.post(`${WIFI_BASE}/Actions/Oem/WiFi.Scan`);
++        await new Promise((resolve) => setTimeout(resolve, 2000));
++        await this.fetchWiFiStatus();
++        await new Promise((resolve) => setTimeout(resolve, 3000));
++        await this.fetchWiFiStatus();
++      } catch (error) {
++        this.errorToast('Failed to start Wi-Fi scan.');
++      }
++    },
++    handleNetworkClick(network) {
++      this.selectedNetwork = network;
++      if (network.Connected) {
++        this.showDisconnectModal = true;
++      } else {
++        this.password = '';
++        this.showConnectModal = true;
++      }
++    },
++    async connectToNetwork() {
++      try {
++        await api.post(`${WIFI_BASE}/Actions/Oem/WiFi.Connect`, {
++          SSID: this.selectedNetwork.SSID,
++          Password: this.password,
++        });
++        this.successToast(`Connecting to ${this.selectedNetwork.SSID}.`);
++        await new Promise((resolve) => setTimeout(resolve, 3000));
++        await this.fetchWiFiStatus();
++        await new Promise((resolve) => setTimeout(resolve, 4000));
++        await this.fetchWiFiStatus();
++      } catch (error) {
++        this.errorToast('Failed to connect to the network.');
++      } finally {
++        this.password = '';
++      }
++    },
++    async disconnectNetwork() {
++      try {
++        await api.post(`${WIFI_BASE}/Actions/Oem/WiFi.Disconnect`);
++        this.successToast('Wi-Fi disconnected.');
++        setTimeout(() => this.fetchWiFiStatus(), 1500);
++      } catch (error) {
++        this.errorToast('Failed to disconnect.');
++      }
++    },
++    formatSignalBars(dbm) {
++      if (dbm >= -55) return 'Excellent';
++      if (dbm >= -70) return 'Good';
++      if (dbm >= -80) return 'Fair';
++      return 'Weak';
++    },
++    signalLevel(dbm) {
++      if (dbm >= -70) return { bars: 3, color: 'green' };
++      if (dbm >= -80) return { bars: 2, color: 'yellow' };
++      return { bars: 1, color: 'red' };
++    },
++  },
++};
++</script>
++
++<style lang="scss" scoped>
++.signal-bars {
++  display: inline-flex;
++  align-items: flex-end;
++  gap: 2px;
++  height: 18px;
++}
++
++.signal-bar {
++  width: 4px;
++  border-radius: 1px;
++  background-color: #d0d0d0;
++}
++
++.signal-green .signal-bar.active {
++  background-color: #28a745;
++}
++
++.signal-yellow .signal-bar.active {
++  background-color: #ffc107;
++}
++
++.signal-red .signal-bar.active {
++  background-color: #dc3545;
++}
++</style>
+diff --git a/src/views/Settings/WiFi/index.js b/src/views/Settings/WiFi/index.js
+new file mode 100644
+index 0000000..b0d34fe
+--- /dev/null
++++ b/src/views/Settings/WiFi/index.js
+@@ -0,0 +1,2 @@
++import WiFi from './WiFi.vue';
++export default WiFi;

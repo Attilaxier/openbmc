@@ -1,0 +1,536 @@
+From 61ae4e554c69d59760b324e8dd9f1b5e4bde7128 Mon Sep 17 00:00:00 2001
+From: attilaxier <developer@example.com>
+Date: Sun, 15 Nov 2026 02:01:59 +0000
+Subject: [PATCH] [meta-raspberrypi4-64] Add simple WiFi redfish API
+
+- Add redfish-wifi meson option to bmcweb, disabled by default
+- Add Wi-Fi OEM routes for status, enable, scan, connect and disconnect
+- Use PACKAGECONFIG += "redfish-wifi" to enable
+
+Upstream-Status: Inappropriate [oe specific]
+---
+ config/meson.build           |   1 +
+ meson.options                |  11 +
+ redfish-core/lib/wifi.hpp    | 385 +++++++++++++++++++++++++++++++++++
+ redfish-core/src/redfish.cpp |   6 +
+ 4 files changed, 403 insertions(+)
+ create mode 100644 redfish-core/lib/wifi.hpp
+
+diff --git a/config/meson.build b/config/meson.build
+index e27f5f5d..379a24cb 100644
+--- a/config/meson.build
++++ b/config/meson.build
+@@ -37,6 +37,7 @@ feature_options = [
+     'redfish-provisioning-feature',
+     'redfish-updateservice-use-dbus',
+     'redfish-use-hardcoded-system-location-indicator',
++    'redfish-wifi',
+     'rest',
+     'session-auth',
+     'static-hosting',
+diff --git a/meson.options b/meson.options
+index 1459295c..023d2b9e 100644
+--- a/meson.options
++++ b/meson.options
+@@ -603,3 +603,14 @@ option(
+                     parameters such as only are not controlled by this option.''',
+ )
+ 
++# Enable the Wi-Fi Redfish OEM API. When enabled, bmcweb exposes
++# /redfish/v1/Managers/bmc/EthernetInterfaces/wlan0/Oem/OpenBmc/WiFi and the
++# WiFi.Scan / WiFi.Connect / WiFi.Disconnect actions, which talk to
++# wpa_supplicant over D-Bus (fi.w1.wpa_supplicant1). Requires wpa_supplicant
++# to be running with its D-Bus interface enabled. Disabled by default.
++option(
++    'redfish-wifi',
++    type: 'feature',
++    value: 'disabled',
++    description: 'Enable Wi-Fi Redfish OEM API (wpa_supplicant based).',
++)
+diff --git a/redfish-core/lib/wifi.hpp b/redfish-core/lib/wifi.hpp
+new file mode 100644
+index 00000000..69191d41
+--- /dev/null
++++ b/redfish-core/lib/wifi.hpp
+@@ -0,0 +1,457 @@
++#pragma once
++
++#include "app.hpp"
++#include "dbus_utility.hpp"
++#include "error_messages.hpp"
++#include "query.hpp"
++#include "registries/privilege_registry.hpp"
++#include "utils/json_utils.hpp"
++
++#include <sdbusplus/asio/property.hpp>
++#include <sdbusplus/message/native_types.hpp>
++
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <map>
++#include <memory>
++#include <optional>
++#include <string>
++#include <variant>
++#include <vector>
++
++namespace redfish
++{
++
++using WpaObjectPath = sdbusplus::object_path;
++
++constexpr const char* wpaService = "fi.w1.wpa_supplicant1";
++constexpr const char* wpaRoot = "/fi/w1/wpa_supplicant1";
++constexpr const char* wpaRootIface = "fi.w1.wpa_supplicant1";
++constexpr const char* wpaIfaceIface = "fi.w1.wpa_supplicant1.Interface";
++constexpr const char* wpaBssIface = "fi.w1.wpa_supplicant1.BSS";
++
++constexpr const char* nicService = "xyz.openbmc_project.Network";
++constexpr const char* nicPath = "/xyz/openbmc_project/network/wlan0";
++constexpr const char* nicIface =
++    "xyz.openbmc_project.Network.EthernetInterface";
++
++constexpr size_t ssidMaxLen = 32;
++constexpr size_t pskMinLen = 8;
++constexpr size_t pskMaxLen = 63;
++
++// Look up the wlan0 interface object path, then hand it to the callback.
++// On failure the callback receives an error_code and an empty path.
++template <typename Callback>
++inline void getWpaInterface(Callback&& cb)
++{
++    crow::connections::systemBus->async_method_call(
++        [cb = std::forward<Callback>(cb)](
++            const boost::system::error_code& ec,
++            const WpaObjectPath& ifacePath) {
++            cb(ec, ifacePath);
++        },
++        wpaService, wpaRoot, wpaRootIface, "GetInterface", "wlan0");
++}
++
++// Set the NICEnabled property of wlan0 and finish the response.
++// onSuccess (optional) runs after the property was set successfully.
++inline void setNicEnabled(const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
++                          bool enabled,
++                          std::function<void()> onSuccess = nullptr)
++{
++    sdbusplus::asio::setProperty(
++        *crow::connections::systemBus, nicService, nicPath, nicIface,
++        "NICEnabled", enabled,
++        [asyncResp, onSuccess = std::move(onSuccess)](
++            const boost::system::error_code& ec) {
++            if (ec)
++            {
++                messages::internalError(asyncResp->res);
++                return;
++            }
++            asyncResp->res.result(boost::beast::http::status::no_content);
++            if (onSuccess)
++            {
++                onSuccess();
++            }
++        });
++}
++
++// After Disconnect, wpa_supplicant stays idle until told to reconnect.
++// Best effort: errors are ignored, wpa_supplicant may auto-connect anyway.
++inline void wpaReconnectBestEffort()
++{
++    getWpaInterface([](const boost::system::error_code& ec,
++                       const WpaObjectPath& ifacePath) {
++        if (ec)
++        {
++            return;
++        }
++        crow::connections::systemBus->async_method_call(
++            [](const boost::system::error_code&) {}, wpaService,
++            ifacePath.str, wpaIfaceIface, "Reconnect");
++    });
++}
++
++// Read one BSS (SSID + signal) and append it to the Networks array.
++inline void addBssEntry(const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
++                        const std::string& path, bool connected)
++{
++    sdbusplus::asio::getProperty<std::vector<uint8_t>>(
++        *crow::connections::systemBus, wpaService, path, wpaBssIface, "SSID",
++        [asyncResp, path, connected](const boost::system::error_code& ssidEc,
++                                     const std::vector<uint8_t>& ssidBytes) {
++            if (ssidEc || ssidBytes.empty())
++            {
++                return;
++            }
++            std::string ssid(ssidBytes.begin(), ssidBytes.end());
++
++            sdbusplus::asio::getProperty<int16_t>(
++                *crow::connections::systemBus, wpaService, path, wpaBssIface,
++                "Signal",
++                [asyncResp, ssid, connected](
++                    const boost::system::error_code& sigEc, int16_t signal) {
++                    if (sigEc)
++                    {
++                        return;
++                    }
++                    nlohmann::json entry;
++                    entry["SSID"] = ssid;
++                    entry["Signal"] = signal;
++                    entry["Connected"] = connected;
++                    asyncResp->res.jsonValue["Networks"].push_back(
++                        std::move(entry));
++                });
++        });
++}
++
++// Query wpa_supplicant for the current BSS and the scan list.
++inline void getWifiNetworks(
++    const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
++    const std::string& ifPath)
++{
++    sdbusplus::asio::getProperty<WpaObjectPath>(
++        *crow::connections::systemBus, wpaService, ifPath, wpaIfaceIface,
++        "CurrentBSS",
++        [asyncResp, ifPath](const boost::system::error_code& bssEc,
++                            const WpaObjectPath& currentBss) {
++            std::string connectedBss;
++            if (!bssEc)
++            {
++                connectedBss = currentBss.str;
++            }
++
++            sdbusplus::asio::getProperty<std::vector<WpaObjectPath>>(
++                *crow::connections::systemBus, wpaService, ifPath,
++                wpaIfaceIface, "BSSs",
++                [asyncResp, connectedBss](
++                    const boost::system::error_code& bssesEc,
++                    const std::vector<WpaObjectPath>& bsses) {
++                    if (bssesEc)
++                    {
++                        return;
++                    }
++                    for (const auto& bss : bsses)
++                    {
++                        addBssEntry(asyncResp, bss.str,
++                                    bss.str == connectedBss);
++                    }
++                });
++        });
++}
++
++// Connect chain: RemoveAllNetworks -> AddNetwork -> SelectNetwork ->
++// SaveConfig. Defined in reverse order so each step can call the next.
++inline void wpaSaveConfig(const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
++                          const std::string& ifPath)
++{
++    crow::connections::systemBus->async_method_call(
++        [asyncResp](const boost::system::error_code& ec) {
++            if (ec)
++            {
++                messages::internalError(asyncResp->res);
++                return;
++            }
++            asyncResp->res.result(boost::beast::http::status::no_content);
++        },
++        wpaService, ifPath, wpaIfaceIface, "SaveConfig");
++}
++
++inline void wpaSelectNetwork(
++    const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
++    const std::string& ifPath, const WpaObjectPath& netPath)
++{
++    crow::connections::systemBus->async_method_call(
++        [asyncResp, ifPath](const boost::system::error_code& ec) {
++            if (ec)
++            {
++                messages::internalError(asyncResp->res);
++                return;
++            }
++            wpaSaveConfig(asyncResp, ifPath);
++        },
++        wpaService, ifPath, wpaIfaceIface, "SelectNetwork", netPath);
++}
++
++inline void wpaAddNetwork(const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
++                          const std::string& ifPath, const std::string& ssid,
++                          const std::string& password)
++{
++    std::map<std::string, std::variant<std::string>> netArgs = {
++        {"ssid", ssid}, {"psk", password}};
++    crow::connections::systemBus->async_method_call(
++        [asyncResp, ifPath](const boost::system::error_code& ec,
++                            const WpaObjectPath& netPath) {
++            if (ec)
++            {
++                messages::internalError(asyncResp->res);
++                return;
++            }
++            wpaSelectNetwork(asyncResp, ifPath, netPath);
++        },
++        wpaService, ifPath, wpaIfaceIface, "AddNetwork", netArgs);
++}
++
++inline void wpaRemoveAllNetworks(
++    const std::shared_ptr<bmcweb::AsyncResp>& asyncResp,
++    const std::string& ifPath, const std::string& ssid,
++    const std::string& password)
++{
++    crow::connections::systemBus->async_method_call(
++        [asyncResp, ifPath, ssid,
++         password](const boost::system::error_code& ec) {
++            if (ec)
++            {
++                messages::internalError(asyncResp->res);
++                return;
++            }
++            wpaAddNetwork(asyncResp, ifPath, ssid, password);
++        },
++        wpaService, ifPath, wpaIfaceIface, "RemoveAllNetworks");
++}
++
++inline void requestRoutesWiFi(App& app)
++{
++    // GET: Wi-Fi state, current SSID and scan list
++    BMCWEB_ROUTE(
++        app,
++        "/redfish/v1/Managers/bmc/EthernetInterfaces/wlan0/Oem/OpenBmc/WiFi/")
++        .privileges(redfish::privileges::getEthernetInterface)
++        .methods(boost::beast::http::verb::get)(
++            [&app](const crow::Request& req,
++                   const std::shared_ptr<bmcweb::AsyncResp>& asyncResp) {
++                if (!redfish::setUpRedfishRoute(app, req, asyncResp))
++                {
++                    return;
++                }
++
++                asyncResp->res.jsonValue["Enabled"] = false;
++                asyncResp->res.jsonValue["Networks"] =
++                    nlohmann::json::array();
++
++                // "Enabled" reflects the real NICEnabled switch, not merely
++                // whether wpa_supplicant still knows about wlan0.
++                sdbusplus::asio::getProperty<bool>(
++                    *crow::connections::systemBus, nicService, nicPath,
++                    nicIface, "NICEnabled",
++                    [asyncResp](const boost::system::error_code& nicEc,
++                                bool nicEnabled) {
++                        if (nicEc)
++                        {
++                            messages::internalError(asyncResp->res);
++                            return;
++                        }
++                        asyncResp->res.jsonValue["Enabled"] = nicEnabled;
++                        if (!nicEnabled)
++                        {
++                            return;
++                        }
++
++                        getWpaInterface(
++                            [asyncResp](const boost::system::error_code& ec,
++                                        const WpaObjectPath& ifacePath) {
++                                if (ec)
++                                {
++                                    return;
++                                }
++                                getWifiNetworks(asyncResp, ifacePath.str);
++                            });
++                    });
++            });
++
++    // PATCH: enable / disable Wi-Fi
++    BMCWEB_ROUTE(
++        app,
++        "/redfish/v1/Managers/bmc/EthernetInterfaces/wlan0/Oem/OpenBmc/WiFi/")
++        .privileges(redfish::privileges::patchEthernetInterface)
++        .methods(boost::beast::http::verb::patch)(
++            [&app](const crow::Request& req,
++                   const std::shared_ptr<bmcweb::AsyncResp>& asyncResp) {
++                if (!redfish::setUpRedfishRoute(app, req, asyncResp))
++                {
++                    return;
++                }
++                std::optional<bool> enabled;
++                if (!json_util::readJsonPatch(req, asyncResp->res, "Enabled",
++                                              enabled))
++                {
++                    return;
++                }
++                if (!enabled)
++                {
++                    // Nothing to change
++                    asyncResp->res.result(
++                        boost::beast::http::status::no_content);
++                    return;
++                }
++
++                if (*enabled)
++                {
++                    // Saved networks are kept, so ask wpa_supplicant to
++                    // reconnect once the NIC is back up.
++                    setNicEnabled(asyncResp, true, wpaReconnectBestEffort);
++                    return;
++                }
++
++                // Disabling: drop the wpa_supplicant association first so the
++                // link and its address are released, then turn the NIC off.
++                // A failure to disconnect must not block the disable.
++                getWpaInterface(
++                    [asyncResp](const boost::system::error_code& ec,
++                                const WpaObjectPath& ifacePath) {
++                        if (ec)
++                        {
++                            setNicEnabled(asyncResp, false);
++                            return;
++                        }
++                        crow::connections::systemBus->async_method_call(
++                            [asyncResp](const boost::system::error_code&) {
++                                setNicEnabled(asyncResp, false);
++                            },
++                            wpaService, ifacePath.str, wpaIfaceIface,
++                            "Disconnect");
++                    });
++            });
++
++    // POST: trigger a scan
++    BMCWEB_ROUTE(
++        app,
++        "/redfish/v1/Managers/bmc/EthernetInterfaces/wlan0/Actions/Oem/WiFi.Scan/")
++        .privileges(redfish::privileges::postEthernetInterface)
++        .methods(boost::beast::http::verb::post)(
++            [&app](const crow::Request& req,
++                   const std::shared_ptr<bmcweb::AsyncResp>& asyncResp) {
++                if (!redfish::setUpRedfishRoute(app, req, asyncResp))
++                {
++                    return;
++                }
++                getWpaInterface([asyncResp](
++                                    const boost::system::error_code& ec,
++                                    const WpaObjectPath& ifacePath) {
++                    if (ec)
++                    {
++                        messages::internalError(asyncResp->res);
++                        return;
++                    }
++                    std::map<std::string, std::variant<std::string>>
++                        scanArgs = {{"Type", "active"}};
++                    crow::connections::systemBus->async_method_call(
++                        [asyncResp](const boost::system::error_code& scanEc) {
++                            if (scanEc)
++                            {
++                                messages::internalError(asyncResp->res);
++                                return;
++                            }
++                            asyncResp->res.result(
++                                boost::beast::http::status::no_content);
++                        },
++                        wpaService, ifacePath.str, wpaIfaceIface, "Scan",
++                        scanArgs);
++                });
++            });
++
++    // POST: connect to an SSID
++    BMCWEB_ROUTE(
++        app,
++        "/redfish/v1/Managers/bmc/EthernetInterfaces/wlan0/Actions/Oem/WiFi.Connect/")
++        .privileges(redfish::privileges::postEthernetInterface)
++        .methods(boost::beast::http::verb::post)(
++            [&app](const crow::Request& req,
++                   const std::shared_ptr<bmcweb::AsyncResp>& asyncResp) {
++                if (!redfish::setUpRedfishRoute(app, req, asyncResp))
++                {
++                    return;
++                }
++                std::string ssid;
++                std::string password;
++                if (!json_util::readJsonAction(req, asyncResp->res, "SSID",
++                                               ssid, "Password", password))
++                {
++                    return;
++                }
++
++                // WPA-PSK limits: SSID 1..32 bytes, passphrase 8..63 chars
++                if (ssid.empty() || ssid.size() > ssidMaxLen)
++                {
++                    messages::propertyValueFormatError(asyncResp->res, ssid,
++                                                       "SSID");
++                    return;
++                }
++                if (password.size() < pskMinLen || password.size() > pskMaxLen)
++                {
++                    messages::propertyValueFormatError(asyncResp->res,
++                                                       "********", "Password");
++                    return;
++                }
++
++                getWpaInterface([asyncResp, ssid, password](
++                                    const boost::system::error_code& ec,
++                                    const WpaObjectPath& ifacePath) {
++                    if (ec)
++                    {
++                        messages::internalError(asyncResp->res);
++                        return;
++                    }
++                    wpaRemoveAllNetworks(asyncResp, ifacePath.str, ssid,
++                                         password);
++                });
++            });
++
++    // POST: disconnect (the saved network is kept for later reconnect)
++    BMCWEB_ROUTE(
++        app,
++        "/redfish/v1/Managers/bmc/EthernetInterfaces/wlan0/Actions/Oem/WiFi.Disconnect/")
++        .privileges(redfish::privileges::postEthernetInterface)
++        .methods(boost::beast::http::verb::post)(
++            [&app](const crow::Request& req,
++                   const std::shared_ptr<bmcweb::AsyncResp>& asyncResp) {
++                if (!redfish::setUpRedfishRoute(app, req, asyncResp))
++                {
++                    return;
++                }
++                getWpaInterface([asyncResp](
++                                    const boost::system::error_code& ec,
++                                    const WpaObjectPath& ifacePath) {
++                    if (ec)
++                    {
++                        messages::internalError(asyncResp->res);
++                        return;
++                    }
++                    crow::connections::systemBus->async_method_call(
++                        [asyncResp](const boost::system::error_code& dcEc) {
++                            if (dcEc)
++                            {
++                                messages::internalError(asyncResp->res);
++                                return;
++                            }
++                            asyncResp->res.result(
++                                boost::beast::http::status::no_content);
++                        },
++                        wpaService, ifacePath.str, wpaIfaceIface,
++                        "Disconnect");
++                });
++            });
++}
++} // namespace redfish
+diff --git a/redfish-core/src/redfish.cpp b/redfish-core/src/redfish.cpp
+index 6cfeea48..defb8a0f 100644
+--- a/redfish-core/src/redfish.cpp
++++ b/redfish-core/src/redfish.cpp
+@@ -67,6 +67,7 @@
+ #include "trigger.hpp"
+ #include "update_service.hpp"
+ #include "virtual_media.hpp"
++#include "wifi.hpp"
+ 
+ namespace redfish
+ {
+@@ -239,6 +240,11 @@ RedfishService::RedfishService(App& app)
+     requestRoutesTriggerCollection(app);
+     requestRoutesTrigger(app);
+ 
++    if constexpr (BMCWEB_REDFISH_WIFI)
++    {
++        requestRoutesWiFi(app);
++    }
++
+     // Note, this must be the last route registered
+     requestRoutesRedfish(app);
+ 
