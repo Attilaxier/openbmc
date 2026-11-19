@@ -54,3 +54,9 @@ KERNEL_MODULE_AUTOLOAD:append = " brcmfmac"
 
 # Add WiFi settings redfish API and Webpage
 ENABLE_WIFI_UI = 1
+
+# Add zerotier service
+IMAGE_INSTALL:append = " zerotier-one"
+WARN_QA:remove = "license-format"
+ERROR_QA:remove = "license-format"
+LICENSE_PATH:append = "${LAYERDIR}/files/custom-licenses/"
