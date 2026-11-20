@@ -28,6 +28,7 @@ LIC_FILES_CHKSUM = "file://LICENSE.txt;md5=10a2f6efeb9fb6ee1dd67b697c8cbc56 \
 FILESEXTRAPATHS:prepend := "${THISDIR}/files/:"
 
 SRC_URI = "git://github.com/zerotier/ZeroTierOne.git;protocol=https;nobranch=1;tag=1.16.2 \
+           file://00-00-zerotier.network \
            "
 
 # On kirkstone or older, use: PV = "1.6.5+git${SRCPV}"
@@ -63,13 +64,18 @@ do_install() {
         install -d ${D}${systemd_system_unitdir}
         install -m 0644 ${S}/debian/zerotier-one.service ${D}${systemd_system_unitdir}/
     fi
+
+    install -d ${D}${sysconfdir}/systemd/network
+    install -m 0644 ${UNPACKDIR}/00-00-zerotier.network ${D}${sysconfdir}/systemd/network/
 }
+
+FILES:${PN} += "${sysconfdir}/systemd/network/00-00-zerotier.network"
 
 inherit systemd
 SYSTEMD_SERVICE:${PN} = "zerotier-one.service"
 
 # Do not enable by default; ZeroTier requires manual setup anyway.
 # On the target: systemctl enable zerotier-one ; systemctl start zerotier-one
-SYSTEMD_AUTO_ENABLE = "disable"
+SYSTEMD_AUTO_ENABLE = "enable"
 
 TARGET_CC_ARCH += "${LDFLAGS}"
